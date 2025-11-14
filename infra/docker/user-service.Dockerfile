@@ -30,7 +30,7 @@ COPY --from=builder /app/dist ./dist
 
 # Create non-root user
 RUN addgroup -g 1001 -S nodejs && \
-    adduser -S nestjs -u 1001
+	adduser -S nestjs -u 1001
 
 USER nestjs
 
