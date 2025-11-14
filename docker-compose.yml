@@ -1,7 +1,11 @@
-version: '3.8'
+version: '3.9'
 
 services:
-  # PostgreSQL Database
+  # -------------------------------------------
+  # INFRASTRUCTURE SERVICES
+  # -------------------------------------------
+
+  # 1. PostgreSQL Database (for User Service)
   postgres:
     image: postgres:16-alpine
     container_name: notification-postgres
@@ -22,13 +26,38 @@ services:
       - notification-network
     restart: unless-stopped
 
-  # RabbitMQ Message Queue
+  # 2. MySQL Database (for Template Service)
+  mysql-template:
+    image: mysql:8.0
+    container_name: notification-mysql-template
+    restart: unless-stopped
+    ports:
+      - "3306:3306"
+    environment:
+      - MYSQL_ROOT_PASSWORD=root
+      - MYSQL_DATABASE=templates
+      - MYSQL_USER=laravel
+      - MYSQL_PASSWORD=secret
+    volumes:
+      - mysql-template-data:/var/lib/mysql
+      # Assuming this my.cnf is also in a shared infra folder
+      # - ./infra/mysql/my.cnf:/etc/mysql/conf.d/my.cnf
+    command: --default-authentication-plugin=mysql_native_password
+    networks:
+      - notification-network
+    healthcheck:
+      test: ["CMD", "mysqladmin" ,"ping", "-h", "localhost", "-u", "root", "-p$$MYSQL_ROOT_PASSWORD"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # 3. RabbitMQ Message Queue (Shared)
   rabbitmq:
     image: rabbitmq:3.13-management-alpine
     container_name: notification-rabbitmq
     hostname: rabbitmq
     ports:
-      - "5672:5672"   # AMQP port
+      - "5672:5672"    # AMQP port
       - "15672:15672" # Management UI port
     environment:
       RABBITMQ_DEFAULT_USER: guest
@@ -44,7 +73,56 @@ services:
       - notification-network
     restart: unless-stopped
 
-  # User Service
+  # 4. Redis Cache (for Email Service)
+  redis-email:
+    image: redis:7
+    container_name: notification-redis-email
+    ports:
+      - "6380:6379" # Host port 6380
+    volumes:
+      - redis-email-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - notification-network
+    restart: unless-stopped
+
+  # 5. Redis Cache (for Template Service)
+  redis-template:
+    image: redis:7-alpine
+    container_name: notification-redis-template
+    restart: unless-stopped
+    ports:
+      - "6379:6379" # Host port 6379
+    volumes:
+      - redis-template-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - notification-network
+
+  # 6. MailHog Fake SMTP (Shared)
+  mailhog:
+    image: mailhog/mailhog
+    container_name: notification-mailhog
+    ports:
+      - "1025:1025" # SMTP port
+      - "8025:8025" # Web UI port
+    networks:
+      - notification-network
+    restart: unless-stopped
+
+  # -------------------------------------------
+  # APPLICATION SERVICES
+  # -------------------------------------------
+
+  # 7. User Service (NestJS)
   user-service:
     build:
       context: ./services/user-service
@@ -57,8 +135,6 @@ services:
       - PORT=3001
       - API_PREFIX=api
       - API_VERSION=v1
-      - ENABLE_SWAGGER=true
-      - SWAGGER_PATH=docs
       - DB_HOST=postgres
       - DB_PORT=5432
       - DB_USERNAME=postgres
@@ -79,7 +155,76 @@ services:
       retries: 3
       start_period: 40s
 
-  # API Gateway
+  # 8. Email Service (FastAPI)
+  email-service:
+    build:
+      context: ./services/email-service
+      dockerfile: ../../infra/docker/email-service.Dockerfile
+    container_name: notification-email-service
+    ports:
+      - "8001:8000"
+    volumes:
+      - ./services/email-service:/app
+    environment:
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_USER=guest
+      - RABBITMQ_PASS=guest
+      - REDIS_HOST=redis-email # <-- Updated
+      - REDIS_PORT=6379
+      - EMAIL_HOST=mailhog
+      - EMAIL_PORT=1025
+      - EMAIL_USER=user
+      - EMAIL_PASSWORD=pass
+      - EMAIL_SENDER=noreply@my-app.com
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis-email:
+        condition: service_healthy
+      mailhog:
+        condition: service_started
+    networks:
+      - notification-network
+    restart: unless-stopped
+
+  # 9. Template Service (Laravel)
+  template-service:
+    build:
+      context: ./services/template-service
+      dockerfile: ../../infra/docker/template-service.Dockerfile
+    container_name: notification-template-service
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_NAME=template_services
+      - APP_ENV=local
+      - APP_DEBUG=true
+      - APP_URL=http://localhost:8000
+      - DB_CONNECTION=mysql
+      - DB_HOST=mysql-template # <-- Updated
+      - DB_PORT=3306
+      - DB_DATABASE=templates
+      - DB_USERNAME=laravel
+      - DB_PASSWORD=secret
+      - CACHE_DRIVER=redis
+      - REDIS_HOST=redis-template # <-- Updated
+      - REDIS_PASSWORD=null
+      - REDIS_PORT=6379
+    volumes:
+      - ./services/template-service:/var/www/html
+      - ./services/template-service/storage:/var/www/html/storage
+    depends_on:
+      mysql-template: # <-- Updated
+        condition: service_healthy
+      redis-template: # <-- Updated
+        condition: service_healthy
+    networks:
+      - notification-network
+    # You should add a healthcheck to your Laravel app
+
+  # 10. API Gateway (NestJS)
   api-gateway:
     build:
       context: ./services/api-gateway
@@ -92,11 +237,10 @@ services:
       - PORT=3000
       - API_PREFIX=api
       - API_VERSION=v1
-      - ENABLE_SWAGGER=true
-      - SWAGGER_PATH=docs
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672
       - USER_SERVICE_URL=http://user-service:3001
-      - TEMPLATE_SERVICE_URL=http://template-service:3003
+      - EMAIL_SERVICE_URL=http://email-service:8000
+      - TEMPLATE_SERVICE_URL=http://template-service:8000 # <-- Updated from 3003
       - JWT_SECRET=${JWT_SECRET:-change-me-in-production}
       - JWT_EXPIRES_IN=15m
     depends_on:
@@ -104,6 +248,10 @@ services:
         condition: service_healthy
       user-service:
         condition: service_healthy
+      email-service:
+        condition: service_started
+      template-service:
+        condition: service_started 
     networks:
       - notification-network
     restart: unless-stopped
@@ -114,10 +262,19 @@ services:
       retries: 3
       start_period: 40s
 
+# -------------------------------------------
+# VOLUMES & NETWORKS
+# -------------------------------------------
 volumes:
   postgres_data:
     driver: local
+  mysql-template-data:
+    driver: local
   rabbitmq_data:
+    driver: local
+  redis-email-data:
+    driver: local
+  redis-template-data:
     driver: local
 
 networks:
