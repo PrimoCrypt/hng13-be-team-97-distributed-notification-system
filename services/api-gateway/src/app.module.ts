@@ -6,6 +6,7 @@ import { AppService } from './app.service';
 import { NotificationsModule } from './notifications/notifications.module';
 import { RabbitMQModule } from './rabbitmq/rabbitmq.module';
 import { AuthModule } from './auth/auth.module';
+import { UsersModule } from './users/users.module';
 import { HealthController } from './health/health.controller';
 
 @Module({
@@ -17,6 +18,7 @@ import { HealthController } from './health/health.controller';
     HttpModule,
     RabbitMQModule,
     AuthModule,
+    UsersModule,
     NotificationsModule,
   ],
   controllers: [AppController, HealthController],
