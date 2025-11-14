@@ -3,7 +3,9 @@ import json
 import asyncio
 from contextlib import asynccontextmanager
 from uuid import UUID
+from datetime import datetime
 from email.message import EmailMessage
+from functools import wraps
 
 import aio_pika
 import httpx
@@ -19,191 +21,218 @@ from .schema import (
     NotificationRequest,
     UserResponse,
     TemplateResponse,
-    NotificationStatusUpdate
 )
 
-# Configure logging first
+# ------------------------------
+# 1. Logging
+# ------------------------------
 setup_logging()
 logger = logging.getLogger(__name__)
 
-
-# --- 2. Global Clients & Configuration ---
-
+# ------------------------------
+# 2. Global Clients
+# ------------------------------
 HTTPX_CLIENT: httpx.AsyncClient | None = None
 REDIS_CLIENT: Redis | None = None
 RABBITMQ_CONNECTION: aio_pika.Connection | None = None
 
+
+# ------------------------------
+# 3. Circuit Breaker (Email)
+# ------------------------------
 mail_circuit_breaker = AsyncCircuitBreaker(
     failure_threshold=5,
     recovery_timeout=30,
-    name="EmailSMTPLimits"
+    name="EmailSMTPCircuitBreaker"
 )
 
+# ------------------------------
+# 4. External URLs
+# ------------------------------
 USER_SERVICE_URL = "http://user-service:8000/api/v1/users"
 TEMPLATE_SERVICE_URL = "http://template-service:8000/api/v1/templates"
-MANAGER_SERVICE_URL = "http://notifications-manager:8000/api/v1/email/status"
 
-async def retry_async(fn, retries=3, delay=0.5, backoff=2):
-    """
-    Generic retry wrapper for async functions.
 
-    fn: the function to execute (already wrapped with args)
-    retries: how many attempts
-    delay: initial delay between retries
-    backoff: multiplier for exponential backoff
-    """
-    for attempt in range(1, retries + 1):
-        try:
-            return await fn()
+# ------------------------------
+# 5. Retry Decorator
+# ------------------------------
+class StopRetry(Exception):
+    """Raise when retry must stop immediately."""
+    pass
 
-        except Exception as e:
-            logger.error(
-                f"Attempt {attempt} failed: {str(e)}"
-            )
 
-            if attempt == retries:
-                # No more retries
-                raise
+def retry_async(retries=3, delay=0.5, backoff=2):
+    def decorator(fn):
+        @wraps(fn)
+        async def wrapper(*args, **kwargs):
+            attempt_delay = delay
 
-            # Wait before next retry
-            await asyncio.sleep(delay)
-            delay *= backoff  # exponential backoff
+            for attempt in range(1, retries + 1):
+                try:
+                    return await fn(*args, **kwargs)
 
-# --- 3. Core Logic: Helper Functions ---
+                except StopRetry as e:
+                    logger.warning(f"Retry stopped explicitly: {e}")
+                    return None
 
-async def fetch_user_details(user_id: UUID) -> UserResponse | None:
-    """Fetches user's email and preferences from the User Service."""
+                except Exception as e:
+                    logger.error(f"Attempt {attempt} failed: {e}")
+                    if attempt == retries:
+                        raise
+
+                    await asyncio.sleep(attempt_delay)
+                    attempt_delay *= backoff
+
+        return wrapper
+    return decorator
+
+
+# ------------------------------
+# 6. Helper Functions
+# ------------------------------
+@retry_async(retries=3)
+async def fetch_user_details(user_id: UUID):
     try:
         response = await HTTPX_CLIENT.get(f"{USER_SERVICE_URL}/{user_id}")
         response.raise_for_status()
         return UserResponse.model_validate(response.json())
+
     except httpx.HTTPStatusError as e:
-        logger.error(f"HTTP error fetching user {user_id}: {e.response.status_code}")
-        return None
-    except httpx.RequestError as e:
-        logger.error(f"Network error fetching user {user_id}: {e}")
-        return None
+        # Stop retrying on 4xx
+        if 400 <= e.response.status_code < 500:
+            raise StopRetry(f"User lookup returned {e.response.status_code}")
+        raise
 
 
+@retry_async(retries=3)
 async def fetch_template(template_code: str) -> TemplateResponse | None:
-    """Fetches the email subject and body template."""
     try:
         url = f"{TEMPLATE_SERVICE_URL}/{template_code}"
         response = await HTTPX_CLIENT.get(url)
         response.raise_for_status()
         return TemplateResponse.model_validate(response.json())
+
     except httpx.HTTPStatusError as e:
-        logger.error(f"HTTP error fetching template {template_code}: {e}")
-        return None
+        logger.error(f"Template fetch error {template_code}: {e}")
+        if 400 <= e.response.status_code < 500:
+            raise StopRetry("Fatal template error")
+        raise
     except httpx.RequestError as e:
-        logger.error(f"Network error fetching template {template_code}: {e}")
-        return None
+        logger.error(f"Network error: {e}")
+        raise
 
+
+@retry_async(retries=3)
 async def save_status_to_redis(notification_id: str, status: str):
-    key = f"notification:{notification_id}"
-    value = {
-        "status": status,
-        "updated_at": datetime.utcnow().isoformat()
-    }
-    await REDIS_CLIENT.hset(key, mapping=value)
+    logger.info(f"Saving status '{status}' for {notification_id} to Redis")
+    try:
+        key = f"notification:{notification_id}"
+        value = {
+            "status": status,
+            "updated_at": datetime.utcnow().isoformat()
+        }
+        await REDIS_CLIENT.hset(key, mapping=value)
 
-#async def report_status(request_id: str, status: #str, error_msg: str = None):
- #   """Reports the final status (delivered/failed#) to the Manager."""
-#    payload = NotificationStatusUpdate(
-    #    notification_id=request_id,
-   #     status=status,
-   #     error=error_msg
-#    )
-#    try:
-#        await HTTPX_CLIENT.post(
-    #        MANAGER_SERVICE_URL,
- #           json=payload.model_dump(exclude_none=True)
-  #      )
-#    except httpx.RequestError as e:
-#        logger.error(f"Failed to report status for {request_id}: {e}")
+    except Exception as e:
+        logger.error(f"Failed to save status to Redis: {e}")
+        raise
 
 
+async def report_status(request_id: str, status: str, error_msg: str = None):
+    try:
+        await save_status_to_redis(request_id, status)
+    except Exception as e:
+        logger.error(f"Could not report status for {request_id}: {e}")
+
+
+# ------------------------------
+# 7. Sending Email
+# ------------------------------
 @mail_circuit_breaker
-async def send_email(to_email: str, subject: str, html_body: str):
-    """Sends the email using aiosmtplib (wrapped by circuit breaker)."""
+async def send_email(to_email: str, subject: str, body_text: str):
     msg = EmailMessage()
-    msg['Subject'] = subject
-    msg['From'] = settings.EMAIL_SENDER
-    msg['To'] = to_email
-    msg.set_content("Please enable HTML to view this email.")
-    msg.add_alternative(html_body, subtype='html')
+    msg["Subject"] = subject
+    msg["From"] = settings.EMAIL_SENDER
+    msg["To"] = to_email
+    msg.set_content(body_text)   # PLAIN TEXT ONLY
 
     await aiosmtplib.send(
         msg,
         hostname=settings.EMAIL_HOST,
         port=settings.EMAIL_PORT,
     )
-    logger.info(f"Successfully sent email to {to_email}")
+
+    logger.info(f"Email sent to {to_email}")
 
 
-# --- 4. Core Logic: Main Processing Function ---
-
+# ------------------------------
+# 8. Main Processing
+# ------------------------------
 async def process_email_request(request: NotificationRequest) -> bool:
-    """
-    Main logic function to process a single notification request.
-    Returns True on success/non-retryable error, False on a retryable failure.
-    """
     idempotency_key = f"idempotency:email:{request.request_id}"
 
     try:
+        # Idempotency
         if await REDIS_CLIENT.get(idempotency_key):
-            logger.warning(f"Duplicate request: {request.request_id}. Skipping.")
+            logger.warning(f"Duplicate request: {request.request_id}")
             return True
 
+        # User lookup
         user = await fetch_user_details(request.user_id)
         if not user:
-            logger.error(f"User {request.user_id} not found. Giving up.")
             await report_status(request.request_id, "failed", "User not found")
             return True
 
         if not user.preferences.email:
-            logger.info(f"User {user.email} has disabled emails. Skipping.")
+            logger.info(f"User {user.email} disabled email")
             return True
 
+        # Template
         template_data = await fetch_template(request.template_code)
         if not template_data:
-            logger.error(f"Template {request.template_code} not found. Retrying.")
-            return False
+            return False  # retryable
 
+        # Render template (plain text)
         try:
             template = Environment(loader=BaseLoader()).from_string(template_data.body)
-            html_body = template.render(request.variables.model_dump())
+            body_text = template.render(request.variables.model_dump())
             subject = template_data.subject
         except Exception as e:
-            logger.error(f"Template rendering failed: {e}")
+            logger.error(f"Template render failure: {e}")
             await report_status(request.request_id, "failed", str(e))
             return True
 
-        await send_email(user.email, subject, html_body)
+        # Send email
+        await send_email(user.email, subject, body_text)
 
+        # Cache idempotency
         await REDIS_CLIENT.set(idempotency_key, "processed", ex=3600)
+
+        # Final status
         await report_status(request.request_id, "delivered")
         return True
 
     except aiosmtplib.SMTPException as e:
-        logger.error(f"SMTP error: {e}. Retrying message.")
+        logger.error(f"SMTP failure: {e}")
         return False
+
     except httpx.RequestError as e:
-        logger.error(f"Network error: {e}. Retrying message.")
+        logger.error(f"Network error: {e}")
         return False
+
     except Exception as e:
-        logger.critical(f"Unhandled error for {request.request_id}: {e}")
+        logger.critical(f"Fatal email service error: {e}")
         await report_status(request.request_id, "failed", str(e))
         return True
 
 
-# --- 5. RabbitMQ Consumer ---
-
+# ------------------------------
+# 9. RabbitMQ Consumer
+# ------------------------------
 async def on_message(message: aio_pika.IncomingMessage):
-    """Callback function for RabbitMQ messages."""
     try:
         body = message.body.decode()
-        logger.info(f"Received message: {body}")
+        logger.info(f"Received: {body}")
 
         request = NotificationRequest.model_validate_json(body)
         success = await process_email_request(request)
@@ -211,25 +240,24 @@ async def on_message(message: aio_pika.IncomingMessage):
         if success:
             await message.ack()
         else:
-            logger.warning(
-                f"NACKing message (will be dead-lettered): {request.request_id}"
-            )
+            logger.warning(f"NACK → {request.request_id}")
             await message.nack(requeue=False)
 
     except json.JSONDecodeError:
-        logger.error("Message is not valid JSON. Discarding.")
+        logger.error("Invalid JSON → ACK")
         await message.ack()
+
     except Exception as e:
-        logger.critical(f"Unprocessable message: {e}. Discarding.")
+        logger.critical(f"Unprocessable: {e}")
         await message.ack()
 
 
-# --- 6. FastAPI Lifespan & App ---
-
+# ------------------------------
+# 10. FastAPI Lifespan
+# ------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global HTTPX_CLIENT, REDIS_CLIENT, RABBITMQ_CONNECTION
-    logger.info("FastAPI app is starting up...")
 
     HTTPX_CLIENT = httpx.AsyncClient()
     REDIS_CLIENT = Redis(
@@ -240,6 +268,7 @@ async def lifespan(app: FastAPI):
 
     loop = asyncio.get_event_loop()
     connected = False
+
     for i in range(5):
         try:
             RABBITMQ_CONNECTION = await aio_pika.connect_robust(
@@ -248,13 +277,9 @@ async def lifespan(app: FastAPI):
                 loop=loop
             )
             connected = True
-            logger.info("Successfully connected to RabbitMQ.")
             break
-        except aio_pika.exceptions.AMQPConnectionError as e:
-            logger.warning(
-                f"RabbitMQ connection failed (Attempt {i+1}/5): {e}. "
-                f"Retrying in 5s..."
-            )
+        except Exception as e:
+            logger.warning(f"RabbitMQ retry {i+1}/5: {e}")
             await asyncio.sleep(5)
 
     if connected:
@@ -263,49 +288,46 @@ async def lifespan(app: FastAPI):
 
         exchange = await channel.declare_exchange(
             "notifications.direct",
-            type=aio_pika.ExchangeType.DIRECT,
-            durable=True
+            durable=True,
+            type=aio_pika.ExchangeType.DIRECT
         )
 
         failed_queue = await channel.declare_queue("failed.queue", durable=True)
-
         email_queue = await channel.declare_queue(
             "email.queue",
             durable=True,
             arguments={
                 "x-dead-letter-exchange": "notifications.direct",
-                "x-dead-letter-routing-key": failed_queue.name,
+                "x-dead-letter-routing-key": "failed.queue",
             }
         )
 
-        await email_queue.bind(exchange, routing_key="email.queue")
-        await failed_queue.bind(exchange, routing_key="failed.queue")
-        logger.info("RabbitMQ exchange and queues declared.")
+        await email_queue.bind(exchange, "email.queue")
+        await failed_queue.bind(exchange, "failed.queue")
 
         await email_queue.consume(on_message)
-        logger.info("Started consuming from 'email.queue'.")
-    else:
-        logger.critical("Could not connect to RabbitMQ after 5 attempts.")
+        logger.info("Email consumer started")
 
     yield
 
-    logger.info("FastAPI app is shutting down...")
+    # Shutdown
     if RABBITMQ_CONNECTION:
         await RABBITMQ_CONNECTION.close()
     if HTTPX_CLIENT:
         await HTTPX_CLIENT.aclose()
     if REDIS_CLIENT:
         await REDIS_CLIENT.aclose()
-    logger.info("All connections closed. Shutdown complete.")
 
 
+# ------------------------------
+# 11. FastAPI App
+# ------------------------------
 app = FastAPI(
     title="Email Notification Service",
     lifespan=lifespan
 )
 
 
-@app.get("/health", status_code=200)
-def health_check():
-    """Endpoint to check if the service is alive."""
+@app.get("/health")
+def health():
     return {"status": "ok", "service": "email-service"}

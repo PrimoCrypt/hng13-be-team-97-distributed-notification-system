@@ -3,6 +3,10 @@ from enum import Enum
 from typing import Optional, Dict
 from uuid import UUID
 
+class NotificationType(str, Enum):
+    email = "email"
+    push = "push"
+
 class UserPreference(BaseModel):
     email: bool = True
     push: bool = False
