@@ -1,17 +1,39 @@
+FROM node:20-alpine AS builder
 
-FROM node:20-alpine
 WORKDIR /app
 
+# Copy package files
+COPY package*.json ./
+
 # Install dependencies
-COPY ./package*.json ./
 RUN npm ci
 
-# Copy all files
+# Copy source code
 COPY . .
 
-# Build app (optional)
+# Build the application
 RUN npm run build
 
-EXPOSE 3000
-CMD ["npm", "run", "start:prod"]
+# Production stage
+FROM node:20-alpine
 
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+
+# Install production dependencies only
+RUN npm ci --omit=dev && npm rebuild bcrypt
+
+# Copy built application from builder
+COPY --from=builder /app/dist ./dist
+
+# Create non-root user
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S nestjs -u 1001
+
+USER nestjs
+
+EXPOSE 3001
+
+CMD ["node", "dist/main.js"]
